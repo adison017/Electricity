@@ -71,6 +71,14 @@ export async function addUsage(formData: FormData) {
     VALUES (${deviceId}, ${hours}, ${usageDate})
   `
 
+  // Increment usage_count for the global device
+  await sql`
+    UPDATE global_devices gd
+    SET usage_count = usage_count + 1
+    FROM devices d
+    WHERE d.global_device_id = gd.id AND d.id = ${deviceId}
+  `
+
   revalidatePath("/dashboard")
   return { success: true }
 }
@@ -96,9 +104,12 @@ export async function deleteUsage(usageId: number) {
   return { success: true }
 }
 
-export async function getStats() {
+export async function getStats(month?: number, year?: number) {
   const user = await getCurrentUser()
   if (!user) return null
+
+  // Debug logging
+  console.log('getStats called with:', { month, year })
 
   // Total cost and usage
   const totalStats = await sql`
@@ -114,7 +125,14 @@ export async function getStats() {
     WHERE d.user_id = ${user.id}
   `
 
-  // This month's stats
+  // Selected month's stats (or current month if not specified)
+  const monthFilter = month && year 
+    ? sql`AND u.date >= ${`${year}-${String(month).padStart(2, '0')}-01`} 
+          AND u.date < (${`${year}-${String(month).padStart(2, '0')}-01`}::date + INTERVAL '1 month')`
+    : sql``
+
+  console.log('Month filter:', monthFilter)
+
   const monthStats = await sql`
     SELECT 
       COALESCE(SUM(u.hours * COALESCE(gd.watt, d.watt) / 1000 * dr.rate), 0) as month_cost,
@@ -125,7 +143,7 @@ export async function getStats() {
     JOIN users usr ON d.user_id = usr.id
     JOIN dorms dr ON usr.dorm_id = dr.id
     WHERE d.user_id = ${user.id}
-    AND u.date >= DATE_TRUNC('month', CURRENT_DATE)
+    ${monthFilter}
   `
 
   // Daily usage for chart (last 7 days)
@@ -162,6 +180,49 @@ export async function getStats() {
     LIMIT 5
   `
 
+  // Top 5 highest cost devices (most power consuming) - ordered by total kWh consumption
+  const highestCostDevices = await sql`
+    SELECT 
+      COALESCE(gd.name, d.name) as name,
+      SUM(u.hours * COALESCE(gd.watt, d.watt) / 1000 * dr.rate) as cost,
+      SUM(u.hours) as total_hours,
+      SUM(u.hours * COALESCE(gd.watt, d.watt) / 1000) as total_kwh
+    FROM devices d
+    LEFT JOIN usages u ON d.id = u.device_id
+    LEFT JOIN global_devices gd ON d.global_device_id = gd.id
+    JOIN users usr ON d.user_id = usr.id
+    JOIN dorms dr ON usr.dorm_id = dr.id
+    WHERE d.user_id = ${user.id}
+    AND u.date IS NOT NULL
+    ${monthFilter}
+    GROUP BY d.id, gd.name, d.name
+    ORDER BY total_kwh DESC NULLS LAST
+    LIMIT 10
+  `
+
+  // Top 5 lowest cost but high usage devices (energy efficient but used often) - ordered by total usage hours
+  const efficientDevices = await sql`
+    SELECT 
+      COALESCE(gd.name, d.name) as name,
+      SUM(u.hours * COALESCE(gd.watt, d.watt) / 1000 * dr.rate) as cost,
+      SUM(u.hours) as total_hours,
+      COALESCE(gd.watt, d.watt) as watt
+    FROM devices d
+    LEFT JOIN usages u ON d.id = u.device_id
+    LEFT JOIN global_devices gd ON d.global_device_id = gd.id
+    JOIN users usr ON d.user_id = usr.id
+    JOIN dorms dr ON usr.dorm_id = dr.id
+    WHERE d.user_id = ${user.id}
+    AND u.date IS NOT NULL
+    ${monthFilter}
+    GROUP BY d.id, gd.name, d.name, gd.watt, d.watt
+    HAVING SUM(u.hours) > 0
+    ORDER BY 
+      total_hours DESC,
+      cost ASC
+    LIMIT 10
+  `
+
   // Device count
   const deviceCount = await sql`
     SELECT COUNT(*) as count FROM devices WHERE user_id = ${user.id}
@@ -173,6 +234,20 @@ export async function getStats() {
     totalLogs: parseInt(totalStats[0].total_logs) || 0,
     monthCost: parseFloat(monthStats[0].month_cost) || 0,
     monthKwh: parseFloat(monthStats[0].month_kwh) || 0,
+    selectedMonth: month,
+    selectedYear: year,
+    highestCostDevices: highestCostDevices.map((d) => ({
+      name: d.name,
+      cost: parseFloat(d.cost) || 0,
+      hours: parseFloat(d.total_hours) || 0,
+      kwh: parseFloat(d.total_kwh) || 0,
+    })),
+    efficientDevices: efficientDevices.map((d) => ({
+      name: d.name,
+      cost: parseFloat(d.cost) || 0,
+      hours: parseFloat(d.total_hours) || 0,
+      watt: parseFloat(d.watt) || 0,
+    })),
     dailyUsage: dailyUsage.map((d) => ({
       date: d.date,
       cost: parseFloat(d.cost) || 0,
